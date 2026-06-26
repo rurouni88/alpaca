@@ -561,3 +561,34 @@ func TestConnectAuthCache_EvictsOnStale407_ThenSucceeds(t *testing.T) {
 	bare, _ := mock.counts()
 	assert.GreaterOrEqual(t, bare, 1, "cold probe must fire after eviction")
 }
+
+func TestConnectAuthCache_NoProbeOnSecondRequest(t *testing.T) {
+	proxySrv, mock := newAuthCacheTestProxy(t, false)
+	proxyURL, err := url.Parse(proxySrv.URL)
+	require.NoError(t, err)
+	auth := newAuthChain(newBasicAuthenticator("user:pass"))
+	cache := &sync.Map{}
+
+	// Pass 1: cold path — cache is empty, proxy will issue a 407 probe.
+	req1 := makeConnectReq(t)
+	conn1, err := connectViaProxy(req1, proxyURL, auth, cache)
+	require.NoError(t, err, "pass 1 must succeed")
+	require.NotNil(t, conn1, "pass 1 connection must be non-nil")
+	conn1.Close()
+
+	bare, _ := mock.counts()
+	assert.Equal(t, 1, bare, "exactly one bare probe expected after pass 1")
+	_, cached := cache.Load(proxyURL.Host)
+	assert.True(t, cached, "cache must have an entry for the proxy host after pass 1")
+
+	// Pass 2: warm path — cache hit must suppress the bare probe entirely.
+	req2 := makeConnectReq(t)
+	conn2, err := connectViaProxy(req2, proxyURL, auth, cache)
+	require.NoError(t, err, "pass 2 must succeed")
+	require.NotNil(t, conn2, "pass 2 connection must be non-nil")
+	conn2.Close()
+
+	bare, authed := mock.counts()
+	assert.Equal(t, 1, bare, "bare probe count must remain 1 after pass 2 (no new probe)")
+	assert.Equal(t, 2, authed, "both passes must have used authenticated CONNECT")
+}

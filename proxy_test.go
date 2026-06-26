@@ -435,6 +435,7 @@ type authCacheMockProxy struct {
 	bareConnects   int
 	authedConnects int
 	respondWith407 bool
+	stale407Once   bool
 }
 
 func (m *authCacheMockProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -449,8 +450,9 @@ func (m *authCacheMockProxy) ServeHTTP(w http.ResponseWriter, req *http.Request)
 	} else {
 		m.bareConnects++
 	}
+	isFirstBare := m.stale407Once && !hasAuth && m.bareConnects == 1
 	m.mu.Unlock()
-	if m.respondWith407 || !hasAuth {
+	if m.respondWith407 || isFirstBare || !hasAuth {
 		w.Header().Set("Proxy-Authenticate", "Basic realm=\"proxy\"")
 		w.WriteHeader(http.StatusProxyAuthRequired)
 		return
@@ -467,6 +469,14 @@ func (m *authCacheMockProxy) counts() (bare, authed int) {
 func newAuthCacheTestProxy(t *testing.T, respondWith407 bool) (*httptest.Server, *authCacheMockProxy) {
 	t.Helper()
 	mock := &authCacheMockProxy{respondWith407: respondWith407}
+	srv := httptest.NewServer(mock)
+	t.Cleanup(srv.Close)
+	return srv, mock
+}
+
+func newStaleOnceTestProxy(t *testing.T) (*httptest.Server, *authCacheMockProxy) {
+	t.Helper()
+	mock := &authCacheMockProxy{stale407Once: true}
 	srv := httptest.NewServer(mock)
 	t.Cleanup(srv.Close)
 	return srv, mock
@@ -534,4 +544,20 @@ func TestConnectAuthCache_EvictsOnStale407(t *testing.T) {
 	assert.False(t, stillCached, "stale cache entry must be evicted after a persistent 407")
 	bare, _ := mock.counts()
 	assert.GreaterOrEqual(t, bare, 1, "a bare probe must be attempted after cache eviction")
+}
+
+func TestConnectAuthCache_EvictsOnStale407_ThenSucceeds(t *testing.T) {
+	proxySrv, mock := newStaleOnceTestProxy(t)
+	proxyURL, err := url.Parse(proxySrv.URL)
+	require.NoError(t, err)
+	auth := newAuthChain(newBasicAuthenticator("user:pass"))
+	cache := &sync.Map{}
+	cache.Store(proxyURL.Host, proxyAuthInfo{schemes: []string{"Basic"}})
+	req := makeConnectReq(t)
+	conn, err := connectViaProxy(req, proxyURL, auth, cache)
+	require.NoError(t, err, "should succeed after stale eviction and cold probe")
+	require.NotNil(t, conn, "connection must be non-nil on success")
+	conn.Close()
+	bare, _ := mock.counts()
+	assert.GreaterOrEqual(t, bare, 1, "cold probe must fire after eviction")
 }

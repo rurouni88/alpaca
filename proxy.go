@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 
 	"golang.org/x/net/proxy"
 )
@@ -220,17 +221,22 @@ func splitChallengeNames(value string) []string {
 	return names
 }
 
+type proxyAuthInfo struct {
+	schemes []string
+}
+
 type ProxyHandler struct {
 	transport *http.Transport
 	auth      *authChain
 	block     func(string)
+	authCache *sync.Map
 }
 
 type proxyFunc func(*http.Request) (*url.URL, error)
 
 func NewProxyHandler(auth *authChain, proxy proxyFunc, block func(string)) ProxyHandler {
 	tr := &http.Transport{Proxy: proxy, TLSClientConfig: tlsClientConfig}
-	return ProxyHandler{tr, auth, block}
+	return ProxyHandler{tr, auth, block, &sync.Map{}}
 }
 
 func (ph ProxyHandler) WrapHandler(next http.Handler) http.Handler {
@@ -270,7 +276,7 @@ func (ph ProxyHandler) handleConnect(w http.ResponseWriter, req *http.Request) {
 	if proxyURL == nil {
 		server, err = connectDirect(req)
 	} else {
-		server, err = connectViaProxy(req, proxyURL, ph.auth)
+		server, err = connectViaProxy(req, proxyURL, ph.auth, ph.authCache)
 		var oe *net.OpError
 		if errors.As(err, &oe) && oe.Op == "proxyconnect" {
 			log.Printf("[%d] Temporarily blocking proxy: %q", id, proxyURL.Host)
@@ -345,7 +351,8 @@ func connectDirect(req *http.Request) (net.Conn, error) {
 	return server, err
 }
 
-func connectViaProxy(req *http.Request, proxyURL *url.URL, auth *authChain) (net.Conn, error) {
+func connectViaProxy(req *http.Request, proxyURL *url.URL, auth *authChain,
+	authCache *sync.Map) (net.Conn, error) {
 	id := req.Context().Value(contextKeyID)
 
 	// SOCKS5 short-circuit: SOCKS5 has its own authentication model
@@ -377,26 +384,75 @@ func connectViaProxy(req *http.Request, proxyURL *url.URL, auth *authChain) (net
 
 	var tr transport
 	defer tr.Close() //nolint:errcheck
-	if err := tr.dial(proxyURL); err != nil {
-		log.Printf("[%d] Error dialling proxy %s: %v", id, proxyURL.Host, err)
-		return nil, err
-	}
-	resp, err := tr.RoundTrip(req)
-	if err != nil {
-		log.Printf("[%d] Error reading CONNECT response: %v", id, err)
-		return nil, err
-	}
-	if resp.StatusCode == http.StatusProxyAuthRequired && auth != nil {
-		log.Printf("[%d] Got %q response, retrying with auth", id, resp.Status)
-		schemes := parseProxyAuthenticateSchemes(resp.Header)
-		_ = resp.Body.Close()
-		// resp is now stale; the retry helper returns a fresh one.
-		authResp, err := retryConnectWithAuth(req, proxyURL, auth, schemes, &tr)
+	activeTr := &tr // points to the transport holding the live tunnel
+
+	var resp *http.Response
+	if cached, ok := authCache.Load(proxyURL.Host); ok && auth != nil {
+		// Phase 1: cache hit — skip unauthenticated probe.
+		info := cached.(proxyAuthInfo)
+		authResp, err := retryConnectWithAuth(req, proxyURL, auth, info.schemes, &tr)
 		if err != nil {
 			return nil, err
 		}
-		log.Printf("[%d] Got %q response", id, authResp.Status)
-		resp = authResp
+		if authResp.StatusCode == http.StatusProxyAuthRequired {
+			// Stale cache entry — evict and fall through to cold probe.
+			authCache.Delete(proxyURL.Host)
+			_ = authResp.Body.Close()
+			tr2 := transport{}
+			defer tr2.Close() //nolint:errcheck
+			activeTr = &tr2
+			if err := tr2.dial(proxyURL); err != nil {
+				log.Printf("[%d] Error dialling proxy %s: %v", id, proxyURL.Host, err)
+				return nil, err
+			}
+			req.Header.Del("Proxy-Authorization")
+			resp2, err := tr2.RoundTrip(req)
+			if err != nil {
+				log.Printf("[%d] Error reading CONNECT response: %v", id, err)
+				return nil, err
+			}
+			if resp2.StatusCode == http.StatusProxyAuthRequired && auth != nil {
+				log.Printf("[%d] Got %q response, retrying with auth", id, resp2.Status)
+				schemes := parseProxyAuthenticateSchemes(resp2.Header)
+				_ = resp2.Body.Close()
+				authResp2, err := retryConnectWithAuth(req, proxyURL, auth, schemes, &tr2)
+				if err != nil {
+					return nil, err
+				}
+				log.Printf("[%d] Got %q response", id, authResp2.Status)
+				resp = authResp2
+			} else {
+				resp = resp2
+			}
+		} else {
+			log.Printf("[%d] Got %q response", id, authResp.Status)
+			resp = authResp
+		}
+	} else {
+		// Phase 2: cold probe — no cached entry.
+		if err := tr.dial(proxyURL); err != nil {
+			log.Printf("[%d] Error dialling proxy %s: %v", id, proxyURL.Host, err)
+			return nil, err
+		}
+		var err error
+		resp, err = tr.RoundTrip(req)
+		if err != nil {
+			log.Printf("[%d] Error reading CONNECT response: %v", id, err)
+			return nil, err
+		}
+		if resp.StatusCode == http.StatusProxyAuthRequired && auth != nil {
+			log.Printf("[%d] Got %q response, retrying with auth", id, resp.Status)
+			schemes := parseProxyAuthenticateSchemes(resp.Header)
+			_ = resp.Body.Close()
+			authCache.Store(proxyURL.Host, proxyAuthInfo{schemes: schemes})
+			// resp is now stale; the retry helper returns a fresh one.
+			authResp, err := retryConnectWithAuth(req, proxyURL, auth, schemes, &tr)
+			if err != nil {
+				return nil, err
+			}
+			log.Printf("[%d] Got %q response", id, authResp.Status)
+			resp = authResp
+		}
 	}
 	_ = resp.Body.Close()
 	if resp.StatusCode == http.StatusProxyAuthRequired {
@@ -406,7 +462,7 @@ func connectViaProxy(req *http.Request, proxyURL *url.URL, auth *authChain) (net
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("[%d] Unexpected response status: %s", id, resp.Status)
 	}
-	return tr.hijack(), nil
+	return activeTr.hijack(), nil
 }
 
 // retryConnectWithAuth iterates the configured auth chain over a CONNECT

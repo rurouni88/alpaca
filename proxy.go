@@ -415,6 +415,7 @@ func connectViaProxy(req *http.Request, proxyURL *url.URL, auth *authChain,
 				log.Printf("[%d] Got %q response, retrying with auth", id, resp2.Status)
 				schemes := parseProxyAuthenticateSchemes(resp2.Header)
 				_ = resp2.Body.Close()
+				authCache.Store(proxyURL.Host, proxyAuthInfo{schemes: schemes})
 				authResp2, err := retryConnectWithAuth(req, proxyURL, auth, schemes, &tr2)
 				if err != nil {
 					return nil, err

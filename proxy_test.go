@@ -450,9 +450,9 @@ func (m *authCacheMockProxy) ServeHTTP(w http.ResponseWriter, req *http.Request)
 	} else {
 		m.bareConnects++
 	}
-	isFirstBare := m.stale407Once && !hasAuth && m.bareConnects == 1
+	isFirstAuthed := m.stale407Once && hasAuth && m.authedConnects == 1
 	m.mu.Unlock()
-	if m.respondWith407 || isFirstBare || !hasAuth {
+	if m.respondWith407 || isFirstAuthed || !hasAuth {
 		w.Header().Set("Proxy-Authenticate", "Basic realm=\"proxy\"")
 		w.WriteHeader(http.StatusProxyAuthRequired)
 		return

@@ -416,13 +416,12 @@ func connectViaProxy(req *http.Request, proxyURL *url.URL, auth *authChain,
 				log.Printf("[%d] Got %q response, retrying with auth", id, resp2.Status)
 				schemes := parseProxyAuthenticateSchemes(resp2.Header)
 				_ = resp2.Body.Close()
-				// Store before attempting: the proxy advertised these schemes, so cache
-				// them now. If re-auth fails the next request skips the bare probe and
-				// evicts on a fresh 407 — same path as any stale entry.
-				authCache.Store(proxyURL.Host, proxyAuthInfo{schemes: schemes})
 				authResp2, err := retryConnectWithAuth(req, proxyURL, auth, schemes, &tr2)
 				if err != nil {
 					return nil, err
+				}
+				if authResp2.StatusCode != http.StatusProxyAuthRequired {
+					authCache.Store(proxyURL.Host, proxyAuthInfo{schemes: schemes})
 				}
 				log.Printf("[%d] Got %q response", id, authResp2.Status)
 				resp = authResp2

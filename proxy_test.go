@@ -518,7 +518,7 @@ func TestConnectAuthCache_SkipsProbeOnCacheHit(t *testing.T) {
 	require.NoError(t, err)
 	auth := newAuthChain(newBasicAuthenticator("user:pass"))
 	cache := &sync.Map{}
-	cache.Store(proxyURL.Host, proxyAuthInfo{schemes: []string{"Basic"}})
+	cache.Store(proxyURL.Host, proxyAuthInfo{schemes: []string{"basic"}})
 	req := makeConnectReq(t)
 	conn, err := connectViaProxy(req, proxyURL, auth, cache)
 	require.NoError(t, err)
@@ -536,14 +536,14 @@ func TestConnectAuthCache_EvictsOnStale407(t *testing.T) {
 	require.NoError(t, err)
 	auth := newAuthChain(newBasicAuthenticator("user:pass"))
 	cache := &sync.Map{}
-	cache.Store(proxyURL.Host, proxyAuthInfo{schemes: []string{"Basic"}})
+	cache.Store(proxyURL.Host, proxyAuthInfo{schemes: []string{"basic"}})
 	req := makeConnectReq(t)
 	_, err = connectViaProxy(req, proxyURL, auth, cache)
 	assert.Error(t, err, "should fail when the proxy rejects all auth attempts")
 	_, stillCached := cache.Load(proxyURL.Host)
 	assert.False(t, stillCached, "stale cache entry must be evicted after a persistent 407")
 	bare, _ := mock.counts()
-	assert.GreaterOrEqual(t, bare, 1, "a bare probe must be attempted after cache eviction")
+	assert.Equal(t, 1, bare, "exactly one bare probe must be attempted after cache eviction")
 }
 
 func TestConnectAuthCache_EvictsOnStale407_ThenSucceeds(t *testing.T) {
@@ -552,14 +552,21 @@ func TestConnectAuthCache_EvictsOnStale407_ThenSucceeds(t *testing.T) {
 	require.NoError(t, err)
 	auth := newAuthChain(newBasicAuthenticator("user:pass"))
 	cache := &sync.Map{}
-	cache.Store(proxyURL.Host, proxyAuthInfo{schemes: []string{"Basic"}})
+	cache.Store(proxyURL.Host, proxyAuthInfo{schemes: []string{"basic"}})
 	req := makeConnectReq(t)
 	conn, err := connectViaProxy(req, proxyURL, auth, cache)
 	require.NoError(t, err, "should succeed after stale eviction and cold probe")
 	require.NotNil(t, conn, "connection must be non-nil on success")
 	conn.Close()
 	bare, _ := mock.counts()
-	assert.GreaterOrEqual(t, bare, 1, "cold probe must fire after eviction")
+	assert.Equal(t, 1, bare, "exactly one bare probe must fire after stale eviction")
+	val, repopulated := cache.Load(proxyURL.Host)
+	assert.True(t, repopulated, "cache must be repopulated after successful stale re-auth")
+	if repopulated {
+		info, ok := val.(proxyAuthInfo)
+		require.True(t, ok)
+		assert.NotEmpty(t, info.schemes, "repopulated cache entry must have schemes")
+	}
 }
 
 func TestConnectAuthCache_NoProbeOnSecondRequest(t *testing.T) {

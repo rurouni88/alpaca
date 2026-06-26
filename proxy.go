@@ -222,6 +222,7 @@ func splitChallengeNames(value string) []string {
 }
 
 type proxyAuthInfo struct {
+	// schemes are lower-cased, matching parseProxyAuthenticateSchemes output.
 	schemes []string
 }
 

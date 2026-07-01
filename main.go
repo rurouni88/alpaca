@@ -208,12 +208,7 @@ func createServer(port int, pacurl string, auth *authChain, enableSocks bool) *h
 			blockProxy(host)
 		}
 	})
-	onPACUpdate := func() {
-		proxyHandler.authCache.Range(func(k, _ any) bool {
-			proxyHandler.authCache.Delete(k)
-			return true
-		})
-	}
+	onPACUpdate := proxyHandler.authCache.Clear
 	proxyFinder := NewProxyFinder(pacurl, pacWrapper, enableSocks, onPACUpdate)
 	blockProxy = proxyFinder.blockProxy
 	mux := http.NewServeMux()

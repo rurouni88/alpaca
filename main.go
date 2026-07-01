@@ -200,8 +200,9 @@ func main() {
 
 func createServer(port int, pacurl string, auth *authChain, enableSocks bool) *http.Server {
 	pacWrapper := NewPACWrapper(PACData{Port: port})
-	// Construction order is load-bearing: authCache must exist before
-	// onPACUpdate is captured, and blockProxy before proxyFinder is used.
+	// Note that proxyHandler and proxyFinder are mutually dependent:
+	// proxyHandler calls proxyFinder.blockProxy(), and proxyFinder calls
+	// proxyHandler.authCache.Clear().
 	var blockProxy func(string)
 	proxyHandler := NewProxyHandler(auth, getProxyFromContext, func(host string) {
 		if blockProxy != nil {

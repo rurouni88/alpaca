@@ -277,7 +277,7 @@ func (ph ProxyHandler) handleConnect(w http.ResponseWriter, req *http.Request) {
 	if proxyURL == nil {
 		server, err = connectDirect(req)
 	} else {
-		server, err = connectViaProxy(req, proxyURL, ph.auth, ph.authCache)
+		server, err = ph.connectViaProxy(req, proxyURL)
 		var oe *net.OpError
 		if errors.As(err, &oe) && oe.Op == "proxyconnect" {
 			log.Printf("[%d] Temporarily blocking proxy: %q", id, proxyURL.Host)
@@ -352,8 +352,40 @@ func connectDirect(req *http.Request) (net.Conn, error) {
 	return server, err
 }
 
-func connectViaProxy(req *http.Request, proxyURL *url.URL, auth *authChain,
-	authCache *sync.Map) (net.Conn, error) {
+// coldProbe dials proxyURL on tr, sends an unauthenticated CONNECT, and handles
+// the 407 response by caching the advertised schemes and retrying with auth.
+// The caller is responsible for deferring tr.Close().
+func coldProbe(req *http.Request, proxyURL *url.URL, auth *authChain,
+	tr *transport, authCache *sync.Map) (*http.Response, error) {
+	id := req.Context().Value(contextKeyID)
+	if err := tr.dial(proxyURL); err != nil {
+		log.Printf("[%d] Error dialling proxy %s: %v", id, proxyURL.Host, err)
+		return nil, err
+	}
+	req.Header.Del("Proxy-Authorization")
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		log.Printf("[%d] Error reading CONNECT response: %v", id, err)
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusProxyAuthRequired || auth == nil {
+		return resp, nil
+	}
+	log.Printf("[%d] Got %q response, retrying with auth", id, resp.Status)
+	schemes := parseProxyAuthenticateSchemes(resp.Header)
+	_ = resp.Body.Close()
+	authResp, err := retryConnectWithAuth(req, proxyURL, auth, schemes, tr)
+	if err != nil {
+		return nil, err
+	}
+	if authResp.StatusCode != http.StatusProxyAuthRequired {
+		authCache.Store(proxyURL.Host, proxyAuthInfo{schemes: schemes})
+	}
+	log.Printf("[%d] Got %q response", id, authResp.Status)
+	return authResp, nil
+}
+
+func (ph *ProxyHandler) connectViaProxy(req *http.Request, proxyURL *url.URL) (net.Conn, error) {
 	id := req.Context().Value(contextKeyID)
 
 	// SOCKS5 short-circuit: SOCKS5 has its own authentication model
@@ -388,74 +420,35 @@ func connectViaProxy(req *http.Request, proxyURL *url.URL, auth *authChain,
 	activeTr := &tr // points to the transport holding the live tunnel
 
 	var resp *http.Response
-	if cached, ok := authCache.Load(proxyURL.Host); ok && auth != nil {
-		// Phase 1: cache hit — skip unauthenticated probe.
+	if cached, ok := ph.authCache.Load(proxyURL.Host); ok && ph.auth != nil {
+		// Cache hit — skip unauthenticated probe.
 		info := cached.(proxyAuthInfo)
-		authResp, err := retryConnectWithAuth(req, proxyURL, auth, info.schemes, &tr)
+		authResp, err := retryConnectWithAuth(req, proxyURL, ph.auth, info.schemes, &tr)
 		if err != nil {
 			return nil, err
 		}
 		if authResp.StatusCode == http.StatusProxyAuthRequired {
 			// Stale cache entry — evict and fall through to cold probe.
-			authCache.Delete(proxyURL.Host)
+			ph.authCache.Delete(proxyURL.Host)
 			_ = authResp.Body.Close()
 			tr2 := transport{}
 			defer tr2.Close() //nolint:errcheck
 			activeTr = &tr2
-			if err := tr2.dial(proxyURL); err != nil {
-				log.Printf("[%d] Error dialling proxy %s: %v", id, proxyURL.Host, err)
-				return nil, err
-			}
-			req.Header.Del("Proxy-Authorization")
-			resp2, err := tr2.RoundTrip(req)
+			var err error
+			resp, err = coldProbe(req, proxyURL, ph.auth, &tr2, ph.authCache)
 			if err != nil {
-				log.Printf("[%d] Error reading CONNECT response: %v", id, err)
 				return nil, err
-			}
-			if resp2.StatusCode == http.StatusProxyAuthRequired && auth != nil {
-				log.Printf("[%d] Got %q response, retrying with auth", id, resp2.Status)
-				schemes := parseProxyAuthenticateSchemes(resp2.Header)
-				_ = resp2.Body.Close()
-				authResp2, err := retryConnectWithAuth(req, proxyURL, auth, schemes, &tr2)
-				if err != nil {
-					return nil, err
-				}
-				if authResp2.StatusCode != http.StatusProxyAuthRequired {
-					authCache.Store(proxyURL.Host, proxyAuthInfo{schemes: schemes})
-				}
-				log.Printf("[%d] Got %q response", id, authResp2.Status)
-				resp = authResp2
-			} else {
-				resp = resp2
 			}
 		} else {
 			log.Printf("[%d] Got %q response", id, authResp.Status)
 			resp = authResp
 		}
 	} else {
-		// Phase 2: cold probe — no cached entry.
-		if err := tr.dial(proxyURL); err != nil {
-			log.Printf("[%d] Error dialling proxy %s: %v", id, proxyURL.Host, err)
-			return nil, err
-		}
+		// Cold probe — no cached entry; populate cache on first 407.
 		var err error
-		resp, err = tr.RoundTrip(req)
+		resp, err = coldProbe(req, proxyURL, ph.auth, &tr, ph.authCache)
 		if err != nil {
-			log.Printf("[%d] Error reading CONNECT response: %v", id, err)
 			return nil, err
-		}
-		if resp.StatusCode == http.StatusProxyAuthRequired && auth != nil {
-			log.Printf("[%d] Got %q response, retrying with auth", id, resp.Status)
-			schemes := parseProxyAuthenticateSchemes(resp.Header)
-			_ = resp.Body.Close()
-			authCache.Store(proxyURL.Host, proxyAuthInfo{schemes: schemes})
-			// resp is now stale; the retry helper returns a fresh one.
-			authResp, err := retryConnectWithAuth(req, proxyURL, auth, schemes, &tr)
-			if err != nil {
-				return nil, err
-			}
-			log.Printf("[%d] Got %q response", id, authResp.Status)
-			resp = authResp
 		}
 	}
 	_ = resp.Body.Close()

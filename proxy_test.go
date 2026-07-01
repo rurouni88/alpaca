@@ -486,7 +486,7 @@ func makeConnectReq(t *testing.T) *http.Request {
 	t.Helper()
 	req, err := http.NewRequest(http.MethodConnect, "https://target.example.com:443", nil)
 	require.NoError(t, err)
-	req.Host = "target.example.com:443"
+	req.Host = req.URL.Host
 	return req
 }
 
@@ -497,7 +497,8 @@ func TestConnectAuthCache_PopulatesOnFirst407(t *testing.T) {
 	auth := newAuthChain(newBasicAuthenticator("user:pass"))
 	cache := &sync.Map{}
 	req := makeConnectReq(t)
-	conn, err := connectViaProxy(req, proxyURL, auth, cache)
+	ph := ProxyHandler{auth: auth, authCache: cache}
+	conn, err := ph.connectViaProxy(req, proxyURL)
 	require.NoError(t, err)
 	if conn != nil {
 		conn.Close()
@@ -520,7 +521,8 @@ func TestConnectAuthCache_SkipsProbeOnCacheHit(t *testing.T) {
 	cache := &sync.Map{}
 	cache.Store(proxyURL.Host, proxyAuthInfo{schemes: []string{"basic"}})
 	req := makeConnectReq(t)
-	conn, err := connectViaProxy(req, proxyURL, auth, cache)
+	ph := ProxyHandler{auth: auth, authCache: cache}
+	conn, err := ph.connectViaProxy(req, proxyURL)
 	require.NoError(t, err)
 	if conn != nil {
 		conn.Close()
@@ -538,7 +540,8 @@ func TestConnectAuthCache_EvictsOnStale407(t *testing.T) {
 	cache := &sync.Map{}
 	cache.Store(proxyURL.Host, proxyAuthInfo{schemes: []string{"basic"}})
 	req := makeConnectReq(t)
-	_, err = connectViaProxy(req, proxyURL, auth, cache)
+	ph := ProxyHandler{auth: auth, authCache: cache}
+	_, err = ph.connectViaProxy(req, proxyURL)
 	assert.Error(t, err, "should fail when the proxy rejects all auth attempts")
 	_, stillCached := cache.Load(proxyURL.Host)
 	assert.False(t, stillCached, "stale cache entry must be evicted after a persistent 407")
@@ -554,7 +557,8 @@ func TestConnectAuthCache_EvictsOnStale407_ThenSucceeds(t *testing.T) {
 	cache := &sync.Map{}
 	cache.Store(proxyURL.Host, proxyAuthInfo{schemes: []string{"basic"}})
 	req := makeConnectReq(t)
-	conn, err := connectViaProxy(req, proxyURL, auth, cache)
+	ph := ProxyHandler{auth: auth, authCache: cache}
+	conn, err := ph.connectViaProxy(req, proxyURL)
 	require.NoError(t, err, "should succeed after stale eviction and cold probe")
 	require.NotNil(t, conn, "connection must be non-nil on success")
 	conn.Close()
@@ -577,8 +581,9 @@ func TestConnectAuthCache_NoProbeOnSecondRequest(t *testing.T) {
 	cache := &sync.Map{}
 
 	// Pass 1: cold path — cache is empty, proxy will issue a 407 probe.
+	ph := ProxyHandler{auth: auth, authCache: cache}
 	req1 := makeConnectReq(t)
-	conn1, err := connectViaProxy(req1, proxyURL, auth, cache)
+	conn1, err := ph.connectViaProxy(req1, proxyURL)
 	require.NoError(t, err, "pass 1 must succeed")
 	require.NotNil(t, conn1, "pass 1 connection must be non-nil")
 	conn1.Close()
@@ -590,7 +595,7 @@ func TestConnectAuthCache_NoProbeOnSecondRequest(t *testing.T) {
 
 	// Pass 2: warm path — cache hit must suppress the bare probe entirely.
 	req2 := makeConnectReq(t)
-	conn2, err := connectViaProxy(req2, proxyURL, auth, cache)
+	conn2, err := ph.connectViaProxy(req2, proxyURL)
 	require.NoError(t, err, "pass 2 must succeed")
 	require.NotNil(t, conn2, "pass 2 connection must be non-nil")
 	conn2.Close()

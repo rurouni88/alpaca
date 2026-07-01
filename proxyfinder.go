@@ -95,6 +95,8 @@ func (pf *ProxyFinder) checkForUpdates() {
 		notify = pf.onPACUpdate
 	}
 	pf.Unlock()
+	// Call outside the lock: the callback flushes authCache and must not re-enter
+	// any ProxyFinder-locked path, but we avoid the risk of a future deadlock here.
 	if notify != nil {
 		notify()
 	}

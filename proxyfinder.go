@@ -76,29 +76,24 @@ func (pf *ProxyFinder) WrapHandler(next http.Handler) http.Handler {
 }
 
 func (pf *ProxyFinder) checkForUpdates() {
+	notify := func() {}
+	defer func() { notify() }()
 	pf.Lock()
+	defer pf.Unlock()
 	pacjs := pf.fetcher.download()
 	if pacjs == nil {
 		if !pf.fetcher.isConnected() {
 			pf.blocked = newBlocklist()
 			pf.wrapper.Wrap(nil)
 		}
-		pf.Unlock()
 		return
 	}
 	pf.blocked = newBlocklist()
-	var notify func()
 	if err := pf.runner.Update(pacjs); err != nil {
 		log.Printf("Error running PAC JS: %q", err)
 	} else {
 		pf.wrapper.Wrap(pacjs)
 		notify = pf.onPACUpdate
-	}
-	pf.Unlock()
-	// Call outside the lock: the callback flushes authCache and must not re-enter
-	// any ProxyFinder-locked path, but we avoid the risk of a future deadlock here.
-	if notify != nil {
-		notify()
 	}
 }
 

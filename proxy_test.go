@@ -435,7 +435,6 @@ type authCacheMockProxy struct {
 	bareConnects   int
 	authedConnects int
 	respondWith407 bool
-	stale407Once   bool
 }
 
 func (m *authCacheMockProxy) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -450,9 +449,8 @@ func (m *authCacheMockProxy) ServeHTTP(w http.ResponseWriter, req *http.Request)
 	} else {
 		m.bareConnects++
 	}
-	isFirstAuthed := m.stale407Once && hasAuth && m.authedConnects == 1
 	m.mu.Unlock()
-	if m.respondWith407 || isFirstAuthed || !hasAuth {
+	if m.respondWith407 || !hasAuth {
 		w.Header().Set("Proxy-Authenticate", "Basic realm=\"proxy\"")
 		w.WriteHeader(http.StatusProxyAuthRequired)
 		return
@@ -474,13 +472,6 @@ func newAuthCacheTestProxy(t *testing.T, respondWith407 bool) (*httptest.Server,
 	return srv, mock
 }
 
-func newStaleOnceTestProxy(t *testing.T) (*httptest.Server, *authCacheMockProxy) {
-	t.Helper()
-	mock := &authCacheMockProxy{stale407Once: true}
-	srv := httptest.NewServer(mock)
-	t.Cleanup(srv.Close)
-	return srv, mock
-}
 
 func makeConnectReq(t *testing.T) *http.Request {
 	t.Helper()
@@ -533,7 +524,7 @@ func TestConnectAuthCache_SkipsProbeOnCacheHit(t *testing.T) {
 }
 
 func TestConnectAuthCache_EvictsOnStale407(t *testing.T) {
-	proxySrv, mock := newAuthCacheTestProxy(t, true)
+	proxySrv, _ := newAuthCacheTestProxy(t, true)
 	proxyURL, err := url.Parse(proxySrv.URL)
 	require.NoError(t, err)
 	auth := newAuthChain(newBasicAuthenticator("user:pass"))
@@ -542,36 +533,11 @@ func TestConnectAuthCache_EvictsOnStale407(t *testing.T) {
 	req := makeConnectReq(t)
 	ph := ProxyHandler{auth: auth, authCache: cache}
 	_, err = ph.connectViaProxy(req, proxyURL)
-	assert.Error(t, err, "should fail when the proxy rejects all auth attempts")
+	assert.Error(t, err, "stale 407 must return an error — no self-heal")
 	_, stillCached := cache.Load(proxyURL.Host)
-	assert.False(t, stillCached, "stale cache entry must be evicted after a persistent 407")
-	bare, _ := mock.counts()
-	assert.Equal(t, 1, bare, "exactly one bare probe must be attempted after cache eviction")
+	assert.False(t, stillCached, "stale cache entry must be evicted on 407")
 }
 
-func TestConnectAuthCache_EvictsOnStale407_ThenSucceeds(t *testing.T) {
-	proxySrv, mock := newStaleOnceTestProxy(t)
-	proxyURL, err := url.Parse(proxySrv.URL)
-	require.NoError(t, err)
-	auth := newAuthChain(newBasicAuthenticator("user:pass"))
-	cache := &sync.Map{}
-	cache.Store(proxyURL.Host, proxyAuthInfo{schemes: []string{"basic"}})
-	req := makeConnectReq(t)
-	ph := ProxyHandler{auth: auth, authCache: cache}
-	conn, err := ph.connectViaProxy(req, proxyURL)
-	require.NoError(t, err, "should succeed after stale eviction and cold probe")
-	require.NotNil(t, conn, "connection must be non-nil on success")
-	conn.Close()
-	bare, _ := mock.counts()
-	assert.Equal(t, 1, bare, "exactly one bare probe must fire after stale eviction")
-	val, repopulated := cache.Load(proxyURL.Host)
-	assert.True(t, repopulated, "cache must be repopulated after successful stale re-auth")
-	if repopulated {
-		info, ok := val.(proxyAuthInfo)
-		require.True(t, ok)
-		assert.NotEmpty(t, info.schemes, "repopulated cache entry must have schemes")
-	}
-}
 
 func TestConnectAuthCache_NoProbeOnSecondRequest(t *testing.T) {
 	proxySrv, mock := newAuthCacheTestProxy(t, false)

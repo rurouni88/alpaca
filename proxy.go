@@ -428,21 +428,11 @@ func (ph *ProxyHandler) connectViaProxy(req *http.Request, proxyURL *url.URL) (n
 			return nil, err
 		}
 		if authResp.StatusCode == http.StatusProxyAuthRequired {
-			// Stale cache entry — evict and fall through to cold probe.
+			// Stale or invalid cache entry — evict and return error.
 			ph.authCache.Delete(proxyURL.Host)
-			_ = authResp.Body.Close()
-			tr2 := transport{}
-			defer tr2.Close() //nolint:errcheck
-			activeTr = &tr2
-			var err error
-			resp, err = coldProbe(req, proxyURL, ph.auth, &tr2, ph.authCache)
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			log.Printf("[%d] Got %q response", id, authResp.Status)
-			resp = authResp
 		}
+		log.Printf("[%d] Got %q response", id, authResp.Status)
+		resp = authResp
 	} else {
 		// Cold probe — no cached entry; populate cache on first 407.
 		var err error

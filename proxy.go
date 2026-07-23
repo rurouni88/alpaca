@@ -417,8 +417,6 @@ func (ph *ProxyHandler) connectViaProxy(req *http.Request, proxyURL *url.URL) (n
 
 	var tr transport
 	defer tr.Close() //nolint:errcheck
-	activeTr := &tr // points to the transport holding the live tunnel
-
 	var resp *http.Response
 	if cached, ok := ph.authCache.Load(proxyURL.Host); ok && ph.auth != nil {
 		// Cache hit — skip unauthenticated probe.
@@ -449,7 +447,7 @@ func (ph *ProxyHandler) connectViaProxy(req *http.Request, proxyURL *url.URL) (n
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("[%d] Unexpected response status: %s", id, resp.Status)
 	}
-	return activeTr.hijack(), nil
+	return tr.hijack(), nil
 }
 
 // retryConnectWithAuth iterates the configured auth chain over a CONNECT
